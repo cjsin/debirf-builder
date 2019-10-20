@@ -1,4 +1,4 @@
-FROM debirf-builder-root:latest
+FROM debirf-builder-base:latest
 
 RUN    groupadd -g 1000 debirf \
     && useradd -u 1000 -g debirf -d /debirf debirf \

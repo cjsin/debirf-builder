@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# Support building a debirf project in stages, using a modified version of debirf
+
 function msg()
 {
     echo "${*}" 1>&2

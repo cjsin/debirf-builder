@@ -1,5 +1,22 @@
 #!/bin/bash -e
 
+# This file is based on the debirf script from the original debirf project.
+# However the following changes were made:
+#   - allow DEBIRF_COMMON to be overridden
+#   - process INCLUDES and EXCLUDES in order so that EXCLUDED packages can later by re-INCLUDED
+#   - use run-parts-wrapper for short-circuiting alread-run scripts and improved output (knowing what is currently running)
+#   - Updated nest init file which supports:
+#       - being less verbose if the kernel commandline has the quiet flag present
+#       - Stuffing around with the compression options
+#       - Added break=err support to troubleshoot compression/decompression
+#   - various minor changes to allow all settings to come from environment
+#     variables (instead of some having to come from a debirf.conf file
+#   - allow empty module directories
+#   - Fixing some things which failed due to merged-usr
+#   - Allow selection of stages such that the debootstrap stage and finalisation
+#     stages can be performed separately - so that the modules stage can be
+#     repeated over and over until it is working.
+
 # debirf: script to build debirf system.
 #
 # The debirf scripts were written by

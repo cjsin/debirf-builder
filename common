@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# This file is based on the debirf common script from the original debirf project.
+# However the following changes were made:
+#   - add /debirf in PATH
+#   - add code down the bottom to look for an extra lib file, 'lib.sh'
+
 # pre-defined common functions for the debirf script.
 # this file is sourced after the debirf.conf file,
 # which defines most of the shell variables

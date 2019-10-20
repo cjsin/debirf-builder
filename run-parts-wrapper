@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# This wrapper script utilises 'run-parts' but
+# adds the ability to skip parts that have already been run,
+# and reports on how many parts were skipped or failed.
+
 echo "${BASH_SOURCE[0]}" "${@}" 1>&2
 
 function run_parts_wrapper()
