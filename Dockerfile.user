@@ -1,0 +1,9 @@
+FROM debirf-builder-root:latest
+
+RUN    groupadd -g 1000 debirf \
+    && useradd -u 1000 -g debirf -d /debirf debirf \
+    && chown -R 1000.1000 /debirf \
+    && chown -R 1000.1000 /debirf
+
+USER 1000
+

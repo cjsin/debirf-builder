@@ -1,0 +1,45 @@
+FROM debian:10
+
+ARG APT_PROXY="http://172.17.0.1:3142"
+ARG REPOS="main contrib non-free"
+ARG EXTRA_PACKAGES=""
+ARG PACKAGES=""
+
+# Note for docker we are using the stretch edge release because there isn't one for buster
+ENV TERM=linux DEBIAN_RELEASE=buster DOCKER_DEBIAN_RELEASE="stretch edge"
+
+# Note the proxy_config text is first generated regardless of whether APT_PROXY is set,
+# and is then updated so that it will be empty if APT_PROXY is empty
+RUN    proxy_config="Acquire::HTTP::Proxy \"${APT_PROXY}\";!Acquire::HTTPS::Proxy \"false\";" \
+    && proxy_config="${APT_PROXY:+${proxy_config}}" \
+    && echo "${proxy_config}" | tr '!' '\n' > /etc/apt/apt.conf.d/01-proxy \
+    && cat /etc/apt/apt.conf.d/01-proxy  \
+    && sed -i "s/main$/${REPOS}/" /etc/apt/sources.list \
+    && mkdir -p /debirf/build /debirf/project \
+    && touch /root/.dpkg.cfg \
+    && mkdir -p /root/.cache/pip \
+    && apt-get -y update \
+    && apt-get install --yes --assume-yes $PACKAGES \
+    && rm -rf /var/lib/apt/lists/*
+#   && apt-get remove --purge -y $(apt-mark showauto) && rm -f rm -rf /var/lib/apt/lists/*
+
+WORKDIR /debirf
+
+COPY debirf run-parts-wrapper debirf-build.sh common packages \
+     debootstrap debootstrap-debian-common debootstrap-functions debootstrap-buster \
+     docker-repo-setup.sh \
+     /debirf/
+
+RUN /debirf/docker-repo-setup.sh \
+     && cp -f  debirf run-parts-wrapper debirf-build.sh /bin/ \
+     && cp -f debootstrap /usr/sbin/ \
+     && cp -f debootstrap-debian-common /usr/share/debootstrap/scripts/debian-common \
+     && cp -f debootstrap-buster /usr/share/debootstrap/scripts/buster \
+     && cp -f debootstrap-functions /usr/share/debootstrap/functions \
+     && dpkg -L debirf \
+     && mv /debirf/common /usr/share/debirf/common \
+     && mv /debirf/packages /usr/share/debirf/packages
+
+ENV PATH=/debirf:/debirf/project:/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/sbin:/usr/local/bin
+
+ENTRYPOINT [ "/bin/debirf-build.sh" ]

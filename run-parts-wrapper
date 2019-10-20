@@ -1,0 +1,139 @@
+#!/bin/bash
+
+echo "${BASH_SOURCE[0]}" "${@}" 1>&2
+
+function run_parts_wrapper()
+{
+    local list_regex='(^|[[:space:]])--list([[:space:]]|$)'
+    local args=("${@}")
+
+    if [[ "${args[*]}" =~ ${list_regex} ]]
+    then
+        /bin/run-parts "${args[@]}"
+    else
+        local persist=0
+        local fast_retry=0
+        local -a keep=()
+        local dir="."
+        local arg
+        for arg in "${args[@]}"
+        do
+            case "${arg}" in
+                --persist)
+                    persist=1
+                    ;;
+                --fast)
+                    fast_retry=1
+                    ;;
+                *)
+                    keep+=("${arg}")
+                    if [[ -d "${arg}" ]]
+                    then
+                        dir="${arg}"
+                    fi
+                    ;;
+            esac
+        done
+
+        local list=$(/bin/run-parts --list "${keep[@]}")
+        local -a parts=()
+        mapfile -t parts <<< "${list}"
+        local p
+
+        local problems=0
+        local skipped=0
+        local ok=0
+        local count=${#parts[@]}
+        for p in "${parts[@]}"
+        do
+            #echo "### Consider ${p}"
+            local f
+            local name="${p##*/}"
+            local timestamp="${DEBIRF_BUILDD}/.${name}"
+            #echo  egrep "^#DEBIRF_SOURCES:" "<"" "${p}" "|" cut -d: -f2-
+            local _sources=$(egrep "^#DEBIRF_SOURCES:" < "${p}" | cut -d: -f2-)
+
+            [[ -n "${_sources}" ]] && echo "DEBIRF_SOURCES='${_sources//\n/,}'"
+
+            if [[ "${_sources}" == "always" ]]
+            then
+                rm -f "${timestamp}"
+                _sources=""
+            fi
+
+            local -a sources=()
+            local -a srcfiles=()
+            mapfile -t sources <<< "${_sources}"
+
+            for f in "${sources[@]}"
+            do
+                if [[ -e "${f}" ]]
+                then
+                    if [[ "${f}" -nt "${timestamp}" ]]
+                    then
+                        echo "${f} has been modified" 1>&2
+                        rm -f "${timestamp}"
+                    fi
+                    if [[ -d "${f}" ]]
+                    then
+                        local _find_files=$(find "${f}" -not -type d)
+                        local -a find_files=()
+                        mapfile -t find_files <<< "${_find_files}"
+                        srcfiles+=("${find_files[@]}")
+                    else
+                        srcfiles+=("${f}")
+                    fi
+                fi
+            done
+            if [[ -f "${timestamp}" ]]
+            then
+                local out_of_date=0
+                for f in "${srcfiles[@]}"
+                do
+                    if [[ "${f}" -nt "${timestamp}" ]]
+                    then
+                        echo "${f} has been modified" 1>&2
+                        out_of_date=1
+                    fi
+                done
+                if (( out_of_date ))
+                then
+                    rm -f "${timestamp}"
+                fi
+            fi
+
+            if (( fast_retry ))
+            then
+                if [[ "${timestamp}" -nt "${p}" ]]
+                then
+                    echo "FAST-RETRY: ${p} appears to be up-to-date" 1>&2
+                    ((skipped++))
+                    continue
+                elif [[ -f "${timestamp}" ]]
+                then
+                    echo "FAST-RETRY: ${p} appears to be out-of-date" 1>&2
+                fi
+            fi
+            rm -f "${timestamp}"
+            echo "${name}:"
+            set -o pipefail
+            if ! /bin/run-parts --report --verbose --regex="${name}" "${keep[@]}"  2>&1 | sed 's/^/    /'
+            then
+                echo "ERROR: Module ${p} failed!" 1>&2
+                ((problems++))
+                if ! (( persist ))
+                then
+                    break
+                fi
+            else
+                ((ok++))
+                touch "${timestamp}"
+            fi
+        done
+        local aborted=$((count-skipped-problems-ok))
+        echo "run-parts: ${ok} ok, ${problems} problems from ${count} items (${skipped} skipped) (${aborted} remain untried)" 1>&2
+        return ${problems}
+    fi
+}
+
+run_parts_wrapper "${@}"

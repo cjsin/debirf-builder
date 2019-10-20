@@ -1,0 +1,1037 @@
+#!/bin/bash -e
+
+# debirf: script to build debirf system.
+#
+# The debirf scripts were written by
+# Jameson Graef Rollins <jrollins@finestructure.net>
+# and
+# Daniel Kahn Gillmor <dkg@fifthhorseman.net>.
+#
+# They are Copyright 2007-2016, and are all released under the GPL,
+# version 3 or later.
+
+###############################################################
+### VARIABLES
+
+CMD=$(basename $0)
+
+unset CDPATH
+DEBIRF_COMMON=${DEBIRF_COMMON:-/usr/share/debirf/common}
+echo "Loading debirf common scripts: ${DEBIRF_COMMON}" $(md5sum "${DEBIRF_COMMON}")
+source "$DEBIRF_COMMON"
+
+DEBIRF_VERSION=unknown
+if [ -r /usr/share/debirf/version ]; then
+    DEBIRF_VERSION=$(cat /usr/share/debirf/version)
+fi
+export DEBIRF_VERSION
+
+# default label
+DEBIRF_LABEL=${DEBIRF_LABEL:-debirf}
+
+# default debirf boot method
+DEBIRF_METHOD=${DEBIRF_METHOD:-nested}
+
+# default build type
+export ROOT_BUILD=false
+
+# stages to run by default
+STAGE_ROOT=${STAGE_ROOT:-true}
+STAGE_MODULES=${STAGE_MODULES:-true}
+STAGE_INITRD=${STAGE_INITRD:-true}
+
+# warn if running as root
+ROOT_WARNING=true
+
+# location of devices.tar.gz file
+export DEVICE_ARCHIVE=${DEVICE_ARCHIVE:-/usr/share/debirf/devices.tar.gz}
+
+# default package include/excludes
+DEBIRF_DEFAULT_PACKAGES=${DEBIRF_DEFAULT_PACKAGES:-/usr/share/debirf/packages}
+
+###############################################################
+### FUNCTIONS
+
+usage() {
+    cat <<EOF
+Usage: $CMD <subcommand> [options] [args]
+Debian in initial ram filesystem tool (version $DEBIRF_VERSION)
+
+subcommands:
+  make [options] PROFILE    build debirf kernel and initramfs
+    -c|--check-vars           check variables before make
+    -p|--print-vars           print variables before make
+    -n|--new                  create new root, even if old one exists
+    -o|--overwrite            debootstrap on top of old root if it exists
+    -s|--skip                 skip debootstrap step if old root exists
+    -r|--root-build           use real chroot to build instead of fakechroot
+                              (requires superuser privileges or CAP_SYS_CHROOT)
+    -w|--no-warning           skip superuser warning when using -r
+    -d|--no-initrd            do not make initramfs
+    -i|--initrd-only          just remake initramfs from existing root
+    -k|--kernel=KERNEL        install KERNEL .deb, instead of default kernel
+  enter PROFILE [CMDS]      enter shell in debirf root (or execute CMDS)
+  makeiso PROFILE           create a bootable ISO using the given profile
+  help                      this help
+
+EOF
+}
+
+usage_profile() {
+    cat <<EOF
+It looks like your profile is not correctly formed.  Please refer to the
+README file included with this package on how to setup a profile.
+EOF
+}
+
+process_includes_excludes() {
+    if [ "$DEBIRF_EXTRA_PACKAGES" ] ; then
+        msg "WARNING: The DEBIRF_EXTRA_PACKAGES variable is no longer supported."
+        msg "WARNING: See debirf(1) for more info on including/excluding packages."
+    fi
+
+    local file="$DEBIRF_BUILDD/.packages"
+
+    # This seems wrong - catting them from the build directory? instead of the profile directory?
+    #if [ -e "$DEBIRF_BUILDD/packages" ] ; then
+    #    cat <"$DEBIRF_BUILDD/packages" >>"$file"
+    #fi
+    cat "$DEBIRF_DEFAULT_PACKAGES" > "${file}"
+
+    if [ -e "$DEBIRF_PACKAGES" ] ; then
+        msg "Using debirf packages from DEBIRF_PACKAGES: ${DEBIRF_PACKAGES}"
+        cat "${DEBIRF_PACKAGES}" >> "${file}"
+    elif [ -f packages ] ; then
+        msg "Using debirf packages from '.': ${PWD}/${DEBIRF_PACKAGES}"
+        cat "packages" >> "${file}"
+    else
+        msg "No customised DEBIRF_PACKAGES or packages file found - using defaults only."
+    fi
+
+    grep -h '^#DEBIRF_PACKAGE>[+-]' $(run-parts --list "$DEBIRF_MODULES") \
+        | sed 's/^#DEBIRF_PACKAGE>//' \
+        | uniq >> "$file"
+
+    sed -r -i -e '/^[[:space:]]*(#|$)/ d' "${file}"
+
+    #local include=$(grep '^+' <"$file" | sort | uniq | sed 's/^+//' | tr '\n' ',')
+    #local exclude=$(grep '^-' <"$file" | sort | uniq | sed 's/^-//' | tr '\n' ',')
+
+    #export INCLUDE=${include%,}
+    #export EXCLUDE=${exclude%,}
+
+    local include=" "
+    local exclude=" "
+
+    # NOTE the original does not allow to include packages which are excluded by
+    # the default packages file. Instead the below reimplementation will allow
+    # a later include/exclude to delete an earlier one.
+    local -a lines
+    #cat "${file}"
+    mapfile -t lines < "${file}"
+    local p
+    for p in "${lines[@]}"
+    do
+        local action="${p:0:1}"
+        p="${p:1}"
+        case "${action}" in
+            "+")
+                #msg "include ${p}"
+                exclude="${exclude// ${p} }"
+                include+="${p} "
+                ;;
+            "-")
+                #msg "exclude ${p}"
+                include="${include// ${p} / }"
+                exclude+="${p} "
+                ;;
+            *)
+                failure "Bad package include or exclude: '${p}' - expected to start with '+' or '-'"
+                ;;
+        esac
+    done
+    export EXCLUDE=$( tr ' ' '\n' <<< "${exclude}" | sort | uniq | egrep . | tr '\n' ',' | sed 's/,$//')
+    export INCLUDE=$( tr ' ' '\n' <<< "${include}" | sort | uniq | egrep . | tr '\n' ',' | sed 's/,$//')
+    # exclude="${exclude% }"
+    #export EXCLUDE="${exclude// /,}"
+    # include="${include# }"
+    # include="${include% }"
+    #export INCLUDE="${include// /,}"
+
+    if [[ -n "${DEBIRF_VERBOSE}" ]] && (( DEBIRF_VERBOSE ))
+    then
+        dump_packages
+    fi
+}
+
+dump_packages()
+{
+    msg "#####"
+    msg "##### Selected packages:"
+    msg "#####"
+    msg "##### Included:"
+    tr ',' '\n' <<< "${INCLUDE}" | column -c 80 | sort | sed 's/^/\t/' 1>&2
+    msg "##### Excluded:"
+    tr ',' '\n' <<< "${EXCLUDE}" | column -c 80 | sort | sed 's/^/\t/' 1>&2
+    msg "#####"
+}
+
+create_debootstrap() {
+    msg "distro/suite: ${DEBIRF_DISTRO}/${DEBIRF_SUITE}"
+
+    local OPTS="--include='$INCLUDE' --exclude='$EXCLUDE' $DEBIRF_SUITE $DEBIRF_ROOT $DEBIRF_MIRROR"
+
+    if [ "$DEBIRF_KEYRING" ] ; then
+        OPTS="--keyring='$DEBIRF_KEYRING' $OPTS"
+    fi
+
+    if [ "$DEBIRF_ARCH" ] ; then
+        OPTS="--arch='$DEBIRF_ARCH' $OPTS"
+    fi
+
+    if [[ -n "${DEBIRF_DEBOOTSTRAP}" ]]
+    then
+        OPTS="${DEBIRF_DEBOOTSTRAP} ${OPTS}"
+    fi
+
+    mkdir -p "$DEBIRF_ROOT"
+
+    msg "debootstrap $OPTS"
+
+   # This isn't really working, we don't seem to get the failure status from the debootstrap
+    # I think the cebootstrap or fakeroot stuff must perform an exit
+    (
+        result=0
+        set -o pipefail
+        if [ "$ROOT_BUILD" = 'true' ] ; then
+            eval "/usr/sbin/debootstrap $OPTS" 2>&1  | sed 's/^/debootstrap:/' #| tee -a $DEBIRF_BUILDD/debootstrap-log
+            result=$?
+            msg "Debootstrap Result=${result}"
+        else
+            eval "fakeroot_if_needed fakechroot /usr/sbin/debootstrap --variant=fakechroot $OPTS"  2>&1 | sed 's/^/debootstrap:/' #| tee -a $DEBIRF_BUILDD/debootstrap-log
+            result=$?
+            msg "Debootstrap Result=${result}"
+        fi
+        ! (( ${result} ))
+    )
+
+    if (( $? ))
+    then
+        failure "debootstrap failed"
+        #tail -n100 "$DEBIRF_ROOT"/var/log/bootstrap.log | sed 's/^/    /' 1>&2
+        exit 1
+    fi
+
+    # FIXME: should this be done in a trap so that the log
+    # debootstrap.log is retrieved from the root in case of failure?
+    fakeroot_if_needed mv "$DEBIRF_ROOT"/var/log/bootstrap.log "$DEBIRF_BUILDD"/.bootstrap.log
+}
+
+# fix the device tree in the debirf root if fakechroot variant was
+# used with debootstrap (default non-privileged behavior)
+fix_dev() {
+    if [ -L "$DEBIRF_ROOT"/dev -o ! -d "$DEBIRF_ROOT"/dev ] ; then
+        msg "fixing debirf root dev tree..."
+
+        # remove old dev
+        fakeroot_if_needed rm -f "$DEBIRF_ROOT"/dev
+
+        # create new dev from devices archive
+        fakeroot_if_needed sh -c "cd $DEBIRF_ROOT; tar -xzf $DEVICE_ARCHIVE"
+
+        # create /dev/console, /dev/null
+        fakeroot_if_needed sh -c "mknod $DEBIRF_ROOT/dev/console c 5 1; chmod 0600 $DEBIRF_ROOT/dev/console"
+        fakeroot_if_needed sh -c "mknod $DEBIRF_ROOT/dev/null c 1 3; chmod 0666 $DEBIRF_ROOT/dev/null"
+    fi
+}
+
+# run modules in modules directory
+run_modules() {
+    fakeroot_if_needed run-parts-wrapper ${DEBIRF_RUN_PARTS} --exit-on-error "$DEBIRF_MODULES"
+}
+
+# pack the rootfs archive
+# takes one input argument as name of output archive file
+pack_rootfs() (
+    # need to pack archive in fakechroot/chroot so that symlinks correctly
+    # point within debirf root, instead of to host path
+
+    # abort with a failure if our attempts to build the rootfs fail:
+    set -o pipefail
+    fakeroot_if_needed bash -c ". $DEBIRF_COMMON > /dev/null 2>&1 && FAKECHROOT_EXCLUDE_PATH=/does-not-exist debirf_exec sh -c 'find * | grep -v -e ^run/ | cpio --create -H newc'" | ${DEBIRF_COMPRESS} > "$1"
+    ls -alh "$1"
+)
+export -f pack_rootfs
+
+# initrd method: stupid simple
+# takes path to initrd as first input
+create_initrd_stupid_simple() {
+    fakeroot_if_needed ln -sf /sbin/init "$DEBIRF_ROOT/init"
+    pack_rootfs "$1"
+}
+
+# initrd method: nested cpio archives
+# takes path to initrd as first input
+create_initrd_nested() {
+    local util lib
+    local INITRD="$1"
+    local NEST_ROOT="$DEBIRF_BUILDD"/nest
+
+    # make the nested root
+    rm -rf "$NEST_ROOT"
+    mkdir -p "$NEST_ROOT"/{bin,lib}
+
+    # copy in busybox-static from root, and link executables
+    cp -f "$DEBIRF_ROOT"/bin/busybox "$NEST_ROOT"/bin/
+    for util in awk cpio free grep gunzip ls mkdir mount rm sh umount head tail sed printf cut tr file; do
+        ln "$NEST_ROOT"/bin/busybox "$NEST_ROOT"/bin/"$util"
+    done
+
+    # copy in run-init and needed libraries
+    cp -f "$DEBIRF_ROOT"/usr/lib/klibc/bin/run-init "$NEST_ROOT"/bin/
+    # NOTE the following klibc files requires the '--merged-usr' option to debootstrap
+    cp -f "$DEBIRF_ROOT"/lib/klibc-* "$NEST_ROOT"/lib/
+
+    # symlink /lib64 if that is done on host
+    # FIXME: is this necessary?
+    if [ -L /lib64 ] && [ $(readlink /lib64) = /lib ] ; then
+	ln -s /lib "$NEST_ROOT"/lib64
+    fi
+    #mknod $NEST_ROOT/dev/null c 1 3
+    #chmod 0666 $NEST_ROOT/dev/null
+
+    ROOT_IMAGE="rootfs.cxz"
+    DEBIRF_COMPRESS="${DEBIRF_COMPRESS:-xz -9}"
+    DEBIRF_DECOMPRESS="${DEBIRF_DECOMPRESS}"
+    DEBIRF_COMPRESS_OUTER="${DEBIRF_COMPRESS_OUTER:-gzip -9}"
+
+    if [[ "${DEBIRF_COMPRESS}" == "none" ]]
+    then
+        DEBIRF_COMPRESS="cat"
+        DEBIRF_DECOMPRESS="cat"
+    fi
+
+    if [[ "${DEBIRF_COMPRESS_OUTER}" == "none" ]]
+    then
+        DEBIRF_COMPRESS_OUTER="cat"
+    fi
+
+    if [[ -z "${DEBIRF_DECOMPRESS}" ]]
+    then
+        case "${DEBIRF_COMPRESS}"
+        in
+            cat)  DEBIRF_DECOMPRESS="cat";;
+            xz*)  DEBIRF_DECOMPRESS="unxz -";;
+            gz*)  DEBIRF_DECOMPRESS="gzip -dc";;
+            *)    failure "Cannot determine a method for DEBIRF_DECOMPRESS (DEBIRF_COMPRESS='${DEBIRF_COMPRESS}'";;
+        esac
+    fi
+
+    # if [[ -z "${DEBIRF_DECOMPRESS_OUTER}" ]]
+    # then
+    #     case "${DEBIRF_COMPRESS_OUTER}"
+    #     in
+    #         cat)  DEBIRF_DECOMPRESS_OUTER="cat";;
+    #         xz*)  DEBIRF_DECOMPRESS_OUTER="unxz -";;
+    #         gz*)  DEBIRF_DECOMPRESS_OUTER="gzip -dc";;
+    #         *)    failure "Cannot determine a method for DEBIRF_DECOMPRESS_OUTER (DEBIRF_COMPRESS_OUTER='${DEBIRF_COMPRESS_OUTER}'";;
+    #     esac
+    # fi
+
+    case "${DEBIRF_COMPRESS}"
+    in
+        cat)  ROOT_IMAGE="rootfs.cpio";;
+        xz*)  ROOT_IMAGE="rootfs.cxz";;
+        gz*)  ROOT_IMAGE="rootfs.cgz";;
+        *)    ROOT_IMAGE="rootfs";;
+    esac
+
+    function nest-init-msg()
+    {
+        echo "${*}" 1>&2
+    }
+    function nest-init-verbose()
+    {
+        [ -n "${quiet}" ] || msg "${*}"
+    }
+    function nest-init-banner()
+    {
+        msg "#### Debarf Initramfs"
+        msg "####     Root Image = ${ROOT_IMAGE} $(ls -l "/${ROOT_IMAGE}" | awk '{printf "%1.1dMB", $5 /(1024/1024) }')"
+        msg "####     Decompress = ${COMPRESS}"
+        msg "####     Unpack     = ${UNPACK}"
+        msg "####     RAM        = $(free -m| head -n2 | tail -n1 | awk '{printf "%dM total %dM used %dM free", $2,$3,$4}')"
+        msg "####"
+        msg "#### Options: [break=top,preunpack,bottom,error,init] [quiet] [printk=n]"
+        msg "####"
+    }
+    function nest-init-unpack()
+    {
+        if [ "${DECOMPRESS}" = "cat" ]
+        then
+            verbose "${UNPACK} < /${ROOT_IMAGE}"
+            ${UNPACK} < "/${ROOT_IMAGE}"
+        else
+            verbose "${DECOMPRESS} < /${ROOT_IMAGE} | ${UNPACK}"
+            ${DECOMPRESS} < "/${ROOT_IMAGE}" | ${UNPACK}
+        fi
+    }
+
+    function nest-init-shell()
+    {
+        banner
+        echo "${*}"
+        echo "Dudebarf Initramfs Boot Shell>"
+        /bin/sh
+    }
+    function nest-init-breakcheck()
+    {
+        if  grep -qEe "(^| )break=(${1}|[^ ]*,${1})" /proc/cmdline
+        then
+            shell "honoring break=${1} kernel arg"
+            return 0
+        elif [ "${2}" = "status" ]
+        then
+            return 1
+        else
+            return 0
+        fi
+    }
+    function nest-init-dudebarf()
+    {
+        mkdir /proc
+        mount -t proc proc /proc
+        if grep -qEe '(^| )quiet( |$)' /proc/cmdline
+        then
+            quiet=1
+            UNPACK="${UNPACK} --quiet"
+        else
+            banner
+        fi
+
+        printk=$(grep -oEe '(^| )printk=([^ ]*)' /proc/cmdline)
+        if [[ -n "${printk}" ]]
+        then
+            awk -v "N=${printk}" '{print $1, $N, $3, $4}' < /proc/sys/kernel/printk > /proc/sys/kernel/printk
+        fi
+
+        breakcheck top
+
+        mkdir /newroot
+        MEMSIZE=$(free | grep 'Mem:' | awk '{ print $2 }')
+        mount -t tmpfs -o size=${MEMSIZE}k,mode=0755 tmpfs /newroot
+
+        breakcheck unpack
+        breakcheck preunpack
+
+        cd /newroot
+        verbose unpacking rootfs...
+        if ! unpack
+        then
+            quiet=""
+            if ! breakcheck error status
+            then
+                banner
+                msg "Unpacking root filesystem failed."
+                msg "You can use break= kernel option to diagnose the problem."
+            else
+                breakcheck error
+            fi
+        fi
+
+        breakcheck bottom
+
+        rm -f "/${ROOT_IMAGE}"
+        breakcheck init
+
+        umount /proc
+        verbose running /sbin/init...
+
+        exec /bin/run-init . /sbin/init < ./dev/console > ./dev/console
+    }
+
+    # create nest init
+    (
+        echo '#!/bin/sh'
+        echo "ROOT_IMAGE='${ROOT_IMAGE}'"
+        echo "DECOMPRESS='${DEBIRF_DECOMPRESS}'"
+        echo "UNPACK='cpio -i'"
+        local func
+        for func in $(declare -f | egrep '^nest-init-.*[(][)]' | awk '{print $1}')
+        do
+            declare -f "${func}" | sed '1 s/^nest-init-//'
+        done
+        echo 'dudebarf'
+    ) > "${NEST_ROOT}/init"
+
+    chmod a+x "$NEST_ROOT"/init
+
+    cp -f "$NEST_ROOT"/init $DEBIRF_BUILDD/nest-init
+
+    msg "creating ${ROOT_IMAGE}..."
+    fakeroot_if_needed ln -sf /sbin/init "$DEBIRF_ROOT/init"
+    timed pack_rootfs "$NEST_ROOT"/"${ROOT_IMAGE}"
+
+    msg "creating wrapper... (with cpio --create -H newc | ${DEBIRF_COMPRESS_OUTER})"
+    timed pack_initrd
+}
+
+function pack_initrd()
+{
+    fakeroot_if_needed sh -c "cd $NEST_ROOT && find * | cpio --create -H newc" | ${DEBIRF_COMPRESS_OUTER} > "$INITRD"
+}
+
+function timed()
+{
+    local -a cmd=("${@}")
+    time "${cmd[@]}"
+    echo "   (timed command was ${cmd[*]})" 1>&2
+}
+
+# determine what the host system distro is, and set debirf build defaults
+# accordingly
+set_distro() {
+    local distro
+    local suite
+
+    if type lsb_release &>/dev/null ; then
+	distro=$(lsb_release --id --short)
+	suite=$(lsb_release --codename --short)
+    else
+	distro="debian"
+	suite="sid"
+    fi
+
+    distro=${distro,,}
+    suite=${suite,,}
+
+    DEBIRF_DISTRO=${DEBIRF_DISTRO:-$distro}
+    DEBIRF_SUITE=${DEBIRF_SUITE:-$suite}
+    DEBIRF_MIRROR=${DEBIRF_MIRROR:-"http://mirrors.kernel.org/${DEBIRF_DISTRO}"}
+    DEBIRF_KEYRING=${DEBIRF_KEYRING:-"/usr/share/keyrings/${DEBIRF_DISTRO}-archive-keyring.gpg"}
+
+    if ! [ -f "$DEBIRF_KEYRING" -a -r "$DEBIRF_KEYRING" ] ; then
+	failure "Cannot read keyring '$DEBIRF_KEYRING' for debootstrap verification."
+    fi
+}
+
+function allow_empty_modules()
+{
+    [[ -n "${DEBIRF_ALLOW_EMPTY_MODULES}" ]] && (( DEBIRF_ALLOW_EMPTY_MODULES ))
+}
+
+
+# setup profile environment
+setup_environment() {
+
+    # get the debirf profile path
+    # FIXME: should we canonicalize DEBIRF_PROFILE to an absolute
+    # path?
+    DEBIRF_PROFILE=${1%%/}
+
+    DEBIRF_PROFILE_NAME=$(cd "$DEBIRF_PROFILE" && basename $(pwd))
+
+    # check profile
+    if [ -d "$DEBIRF_PROFILE" ]
+    then
+        msg "loading profile '$DEBIRF_PROFILE_NAME'..."
+        DEBIRF_CONF="${DEBIRF_CONF:-$DEBIRF_PROFILE/debirf.conf}"
+    elif [[ -n "${DEBIRF_CONF}" && "${DEBIRF_MODULES}" ]]
+    then
+        failure "Profile '$DEBIRF_PROFILE' not found and neither DEBIRF_CONF nor DEBIRF_MODULES were defined."
+    fi
+
+    # source profile debirf.conf
+    if [ -f "$DEBIRF_CONF" ]
+    then
+        source "$DEBIRF_CONF"
+    fi
+
+    DEBIRF_MODULES="${DEBIRF_MODULES:-$DEBIRF_PROFILE/modules}"
+
+    if [[ -n "${DEBIRF_MODULES}" && "${DEBIRF_MODULES:0:1}" != "/" ]]
+    then
+        DEBIRF_MODULES="${DEBIRF_PROFILE}/${DEBIRF_MODULES}"
+    fi
+
+    if [ "$STAGE_MODULES" = 'true' ] ; then
+
+        # check modules directory
+        [ -d "$DEBIRF_MODULES" ] || failure "Modules directory '$DEBIRF_MODULES' does not exist or is empty."
+
+        [ -n "$(ls "$DEBIRF_MODULES")" ] || allow_empty_modules || failure "Modules directory is empty."
+
+        local MODULE
+        for MODULE in $(find "$DEBIRF_MODULES" -type f)
+        do
+            [ -s "$MODULE" ] || allow_empty_modules || failure "Module '$MODULE' is a broken link or empty file."
+        done
+    fi
+
+    # set/check buildd
+    DEBIRF_BUILDD=${DEBIRF_BUILDD:-"$DEBIRF_PROFILE"}
+    [ -d "$DEBIRF_BUILDD" ] || failure "Could not find build directory '$DEBIRF_BUILDD'."
+
+    # "absolutize" the buildd path
+    # This is needed because of trouble with fakechroot (see
+    # http://bugs.debian.org/548691)
+    DEBIRF_BUILDD=$(cd "$DEBIRF_BUILDD" && pwd)
+
+    # set root directory
+    DEBIRF_ROOT="$DEBIRF_BUILDD/root"
+
+    # set fakechroot save file
+    DEBIRF_FAKEROOT_STATE="$DEBIRF_BUILDD/.fakeroot-state.${DEBIRF_LABEL}"
+
+    [[ -n "${DEBIRF_PROXY}" ]] && export http_proxy="${DEBIRF_PROXY}"
+
+    # set the debirf distro variables based on host distro
+    set_distro
+
+    # export all the DEBIRF_* environment variables:
+    for var in ${!DEBIRF_*}; do
+        if [ $var ] ; then
+            export $var
+        else
+            failure "Variable '$var' not properly set."
+        fi
+    done
+
+    # check variables
+    if (( PRINT_VARS )) || [ "$CHECK_VARS" ]
+    then
+        msg "debirf variables:"
+        env | /bin/grep "^DEBIRF_"
+    fi
+
+    if [ "${CHECK_VARS}" ]
+    then
+        read -p "enter to continue: " OK
+    fi
+}
+
+# make profile
+make() {
+    # option parsing
+    TEMP=$(getopt --options -hpcnosrwdik: --longoptions help,check-vars,new,overwrite,skip,root-build,no-warning,no-initrd,initrd-only,kernel: -n "$CMD" -- "$@")
+
+    if [ $? != 0 ] ; then
+	echo "Invalid options." >&2
+	usage
+	exit 1
+    fi
+
+    # Note the quotes around `$TEMP': they are essential!
+    eval set -- "$TEMP"
+
+    while true ; do
+	case "$1" in
+            -c|--check-vars)
+		CHECK_VARS=true
+		shift 1
+		;;
+            -p|--print-vars)
+		PRINT_VARS=1
+		shift 1
+		;;
+            -n|--new)
+		if [ "$WRITE_MODE" ] ; then
+		   failure "Only one of the -n/-o/-s switches may be specified at once."
+		fi
+		WRITE_MODE=rewrite
+		shift 1
+		;;
+            -o|--overwrite)
+		if [ "$WRITE_MODE" ] ; then
+		   failure "Only one of the -n/-o/-s switches may be specified at once."
+		fi
+		WRITE_MODE=overwrite
+		shift 1
+		;;
+            -s|--skip)
+		if [ "$WRITE_MODE" ] ; then
+		   failure "Only one of the -n/-o/-s switches may be specified at once."
+		fi
+		WRITE_MODE=skip
+		shift 1
+		;;
+            -r|--root-build)
+		ROOT_BUILD=true
+		shift 1
+		;;
+            -w|--no-warning)
+		ROOT_WARNING=false
+		shift 1
+		;;
+	    -d|--no-initrd)
+		STAGE_INITRD=false
+		shift 1
+		;;
+	    -i|--initrd-only)
+		STAGE_ROOT=false
+		STAGE_MODULES=false
+		shift 1
+		;;
+	    -k|--kernel)
+		DEBIRF_KERNEL_PACKAGE="$2"
+		shift 2
+		;;
+            --)
+		shift
+		;;
+            *)
+		if (( $# < 1 )) ; then
+		    echo "Improper number of input arguments."
+		    usage
+		    exit 1
+		fi
+		break
+		;;
+	esac
+    done
+
+    if [ $(id -u) = '0' ] ; then
+	cat <<EOF
+Warning: You are running debirf as root.  There is a potential
+for improperly written modules to damage your system.
+EOF
+	if [ "$ROOT_WARNING" = 'true' ] ; then
+	    read -p "Are you sure you wish to continue? [y|N]: " OK; OK=${OK:=N}
+	    if [ "${OK/y/Y}" != 'Y' ] ; then
+		failure "aborting."
+	    fi
+	fi
+    fi
+
+    setup_environment "$1"
+    shift
+
+    if [ "$DEBIRF_KERNEL_PACKAGE" ] ; then
+	if [ -f "$DEBIRF_KERNEL_PACKAGE" ] ; then
+	    msg "using kernel package '$DEBIRF_KERNEL_PACKAGE'"
+	else
+	    failure "Kernel package '$DEBIRF_KERNEL_PACKAGE' not found."
+	fi
+    fi
+
+    process_includes_excludes
+
+    ### BUILD ROOT
+    if [ "$STAGE_ROOT" = 'true' ] ; then
+        # determine write mode
+	if [ -d "$DEBIRF_ROOT" ] ; then
+	    if [ -z "$WRITE_MODE" ] ; then
+		msg "debirf root already exists.  select one of the following:"
+		CASE1='new: delete the old root and create a new one'
+		CASE2='overwrite: leave the old root and debootstrap on top of it'
+		CASE3='skip: skip building the root and go right to installing modules'
+		CASE4='exit'
+		select CASE in "$CASE1" "$CASE2" "$CASE3" "$CASE4" ; do
+		    case "$REPLY" in
+			1)
+			    WRITE_MODE=rewrite
+			    ;;
+			2)
+			    WRITE_MODE=overwrite
+			    ;;
+			3)
+			    WRITE_MODE=skip
+			    ;;
+			*)
+			    failure "aborting."
+			    ;;
+		    esac
+		    break
+		done
+	    fi
+	else
+	    WRITE_MODE=new
+	fi
+   	case "$WRITE_MODE" in
+	    'new')
+		msg "creating debirf root..."
+        mkdir -p "$DEBIRF_ROOT/root"
+        touch "$DEBIRF_ROOT/root/.dpkg.cfg"
+		> "$DEBIRF_FAKEROOT_STATE"
+        export HOME=/
+        #ls -al /debirf/.dpkg.cfg /root/.dpkg.cfg $DEBIRF_ROOT/root/.dpkg.cfg || /bin/true
+		create_debootstrap
+		;;
+	    'rewrite')
+		msg "clearing old debirf root..."
+		rm -rf "$DEBIRF_ROOT"
+		msg "creating debirf root..."
+		> "$DEBIRF_FAKEROOT_STATE"
+		create_debootstrap
+		;;
+	    'overwrite')
+		msg "overwriting old debirf root..."
+		create_debootstrap
+		;;
+	    'skip')
+		msg "SKIP debootstrap..."
+		;;
+	    *)
+		failure "aborting."
+		;;
+	esac
+
+        # fix the dev tree if running as non-priv user (fakechroot debootstrap)
+	fix_dev
+
+    else
+	msg "SKIP building root"
+    fi
+    ### END BUILD ROOT
+
+    ### RUN MODULES
+    if [ "$STAGE_MODULES" = 'true' ] ; then
+	msg "executing modules..."
+	run_modules
+	msg "modules complete"
+    else
+	msg "SKIP modules"
+    fi
+    ### END RUN MODULES
+
+    ### BUILD INITRD
+    if [ "$STAGE_INITRD" = 'true' ] ; then
+	if [ ! -d "$DEBIRF_ROOT" ] ; then
+	    failure "Debirf root '$DEBIRF_ROOT' not found."
+	fi
+        # determine initramfs name
+	local KERNEL_VERS=$(ls -1 "${DEBIRF_ROOT}/lib/modules" | head -n1)
+	if [[ -z "${KERNEL_VERS}" ]]
+	then
+		echo "No kernel found!"
+		exit 1
+	fi
+
+	local INITRD="${DEBIRF_INITRD:-${DEBIRF_LABEL}_${DEBIRF_SUITE}_}${KERNEL_VERS}.cgz"
+
+	msg "creating debirf initrd ('$DEBIRF_METHOD')..."
+	create_initrd_${DEBIRF_METHOD} "${DEBIRF_BUILDD}/${INITRD}"
+
+        # final output
+	local KERNEL=$(ls "$DEBIRF_BUILDD" | grep "vmlinu" | grep "$KERNEL_VERS\$")
+	msg "debirf initrd created."
+	if [ "${DEBIRF_BUILDD}/${KERNEL}" ] ; then
+	    msg "kernel: ${DEBIRF_BUILDD}/${KERNEL}"
+	fi
+	    msg "initrd: ${DEBIRF_BUILDD}/${INITRD}"
+    else
+	    msg "SKIP creating initramfs."
+    fi
+    ### END BUILD INITRD
+}
+
+# enter profile root
+enter() {
+    setup_environment "$1"
+    shift
+
+    if [ "$1" ] ; then
+        fakeroot_if_needed bash -c ". $DEBIRF_COMMON && debirf_exec $@"
+    else
+        fakeroot_if_needed bash -c ". $DEBIRF_COMMON && debirf_exec bash -i"
+    fi
+}
+
+# create an ISO from the given kernel and initramfs (requires GRUB,
+# see:
+# http://www.gnu.org/software/grub/manual/html_node/Making-a-GRUB-bootable-CD-ROM.html)
+makeiso() {
+    setup_environment "$1"
+    shift
+
+    [ -d "$DEBIRF_PROFILE" ] || failure "'$DEBIRF_PROFILE' does not seem to be a directory"
+
+    # find kernel
+    case $(cd "${DEBIRF_BUILDD}" && ls -1 | grep -c '^vmlinu.*$') in
+	0)
+	    failure "Failed to find a kernel.  Maybe you need to run 'debirf make $DEBIRF_PROFILE' first?"
+	    ;;
+	1)
+	    msg "kernel found."
+	    local KERNEL=${KERNEL:-$(cd "${DEBIRF_BUILDD}" && ls -1 vmlinu*)}
+	    ;;
+	*)
+	    failure "Multiple kernels found.  Please clear out all but the desired kernel."
+	    ;;
+    esac
+
+    # find initramfs
+    case $(cd "${DEBIRF_BUILDD}" && ls -1 | grep -c "^${DEBIRF_LABEL}"'_.*\.cgz$') in
+	0)
+	    failure "Failed to find a single initramfs.  Maybe you need to run 'debirf make $DEBIRF_PROFILE' first?"
+	    ;;
+	1)
+	    msg "initramfs found."
+	    local INITRAMFS=${INITRAMFS:-$(cd "${DEBIRF_BUILDD}" && ls -1 "${DEBIRF_LABEL}"_*.cgz)}
+	    ;;
+	*)
+	    failure "Multiple initramfs found.  Please clear out all but the desired initramfs."
+	    ;;
+    esac
+
+    # determine which eltorito boot loader we're using
+    if [ -z "$DEBIRF_ISO_BOOTLOADER" ] ; then
+	if which grub-mkrescue >/dev/null ; then
+	    local DEBIRF_ISO_BOOTLOADER=grub
+	elif [ -f /usr/lib/ISOLINUX/isolinux.bin ] ; then
+            if [ -f /usr/lib/syslinux/modules/bios/ldlinux.c32 ] ; then
+	        local DEBIRF_ISO_BOOTLOADER=isolinux
+            else
+                failure "no suitable El Torito bootloader found: need syslinux-common to work with isolinux"
+            fi
+	else
+	    failure "Suitable El Torito boot loader not found.  Please install grub-pc or isolinux."
+	fi
+    fi
+
+    msg "creating debirf iso..."
+
+    # determine the iso name from the initramfs
+    local ISO=$(basename "$INITRAMFS" .cgz).iso
+
+    # create clean iso directory
+    local ISODIR="${DEBIRF_BUILDD}/iso"
+    rm -rf "$ISODIR"
+    mkdir -p "$ISODIR"
+
+    case "$DEBIRF_ISO_BOOTLOADER" in
+	grub)
+	    msg "using GRUB as bootloader..."
+
+	    # use hard links to avoid massive copying time (we're almost certainly on the same filesystem)
+	    ln "${DEBIRF_BUILDD}/${KERNEL}" "${ISODIR}/" || failure "Failed to link kernel into iso"
+	    ln "${DEBIRF_BUILDD}/${INITRAMFS}" "${ISODIR}/" || failure "Failed to link initramfs into iso"
+
+	    # make grub.cfg
+	    mkdir -p "$ISODIR"/boot/grub/
+	    cat >"$ISODIR"/boot/grub/grub.cfg <<EOF
+
+## MENU
+insmod serial
+serial --unit=0 --speed=115200
+
+terminal_input serial console
+terminal_output serial console
+
+menuentry "Debirf: $DEBIRF_LABEL, video console (created $(date -R))" {
+        linux   /$KERNEL console=ttyS0,115200n8 console=tty0
+        initrd  /$INITRAMFS
+}
+menuentry "Debirf: $DEBIRF_LABEL, serial console (created $(date -R))" {
+        linux   /$KERNEL console=tty0 console=ttyS0,115200n8
+        initrd  /$INITRAMFS
+}
+EOF
+
+	    # make the grub iso
+    	    grub-mkrescue --output="${DEBIRF_BUILDD}/${ISO}" "$ISODIR"
+	    ;;
+
+	isolinux)
+	    msg "using isolinux as bootloader..."
+            ISOLINUX_FILES="/usr/lib/syslinux/modules/bios/ldlinux.c32 /usr/lib/ISOLINUX/isolinux.bin"
+            for f in $ISOLINUX_FILES; do
+                if ! [ -f "$f" ]; then
+                    failure "Need file '$f' to build isolinux-based ISO"
+                fi
+            done
+
+            (which xorriso > /dev/null) || failure "xorriso is not in your path.  Maybe you need to install it?"
+
+
+	    # use hard links to avoid massive copying time (we're almost certainly on the same filesystem):
+	    ln "${DEBIRF_BUILDD}/${KERNEL}" "${ISODIR}/vmlinuz" || failure "Failed to link kernel into iso"
+	    ln "${DEBIRF_BUILDD}/${INITRAMFS}" "${ISODIR}/debirf.cfg" || failure "Failed to link initramfs into iso"
+
+	    # insert isolinux eltorito image
+            mkdir -p "$ISODIR"/boot/isolinux
+	    cp $ISOLINUX_FILES "$ISODIR"/boot/isolinux
+
+	    # make isolinux menu
+	    cat >"$ISODIR"/isolinux.cfg <<EOF
+serial 0 115200
+prompt 1
+timeout 0
+display menu
+default video
+
+# serial console
+label serial
+  kernel vmlinuz
+  append initrd=debirf.cfg console=tty0 console=ttyS0,115200n8
+
+# video console
+label video
+  kernel vmlinuz
+  append initrd=debirf.cfg console=ttyS0,115200n8 console=tty0
+
+EOF
+	    cat >"$ISODIR"/menu <<EOF
+
+Welcome to debirf: DEBian on InitRamFs
+
+label: $DEBIRF_LABEL
+kernel: $KERNEL
+initramfs: $INITRAMFS
+created: $(date -R)
+
+type 'video' for video console i/o (default)
+type 'serial' for serial console i/o
+
+EOF
+
+	    # generate the iso
+            rm -f "${DEBIRF_BUILDD}/${ISO}" # make sure it's not already present
+	    xorriso \
+                -report_about WARNING \
+                -outdev "${DEBIRF_BUILDD}/${ISO}" \
+                -map "$ISODIR" / \
+                -boot_image isolinux dir=/boot/isolinux
+	    ;;
+
+	*)
+
+	    failure "unknown iso boot loader '$DEBIRF_ISO_BOOTLOADER'"
+	    ;;
+    esac
+
+    # do we need to clean up the iso/ directory so that this can be run again?
+
+    msg "debirf iso created."
+    msg "iso: ${DEBIRF_BUILDD}/${ISO}"
+}
+
+
+###############################################################
+### MAIN
+
+COMMAND="$1"
+[ "$COMMAND" ] || failure "Type '$CMD help' for usage."
+shift
+
+case $COMMAND in
+    'make'|'m')
+        make "$@"
+        ;;
+    'makeiso'|'i')
+        makeiso "$@"
+        ;;
+    'enter'|'e')
+        STAGE_MODULES=false
+        STAGE_INITRD=false
+        STAGE_ROOT=false
+        enter "$@"
+        ;;
+    'help'|'h'|'?'|'-h'|'--help')
+        usage
+        ;;
+    *)
+        failure "Unknown command: '$COMMAND'
+Type '$CMD help' for usage."
+        ;;
+esac

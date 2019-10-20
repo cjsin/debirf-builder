@@ -1,0 +1,98 @@
+#!/bin/bash
+
+# pre-defined common functions for the debirf script.
+# this file is sourced after the debirf.conf file,
+# which defines most of the shell variables
+#
+# The debirf scripts were written by
+# Jameson Graef Rollins <jrollins@finestructure.net>
+# and
+# Daniel Kahn Gillmor <dkg@fifthhorseman.net>.
+#
+# They are Copyright 2007-2011, and are all released under the GPL,
+# version 3 or later.
+
+###############################################################
+### VARIABLES
+
+# set locale default
+export LC_CTYPE="C"
+export LC_ALL="C"
+export LANGUAGE="C"
+export LANG="C"
+
+###############################################################
+
+# cause debirf to exit immediately with message and exit code
+# failure message <exit-code>
+function failure()
+{
+    echo "${@}" >&2
+    exit ${2:-'1'}
+}
+export -f failure
+
+# output debirf message to stdout
+function msg()
+{
+    echo "debirf> ${*}" >&2
+}
+export -f msg
+
+function fakeroot_if_needed()
+{
+    if [ "${ROOT_BUILD}" = 'true' ]
+    then
+        "${@}"
+    else
+        if ! [ -e "${DEBIRF_FAKEROOT_STATE}" ]
+        then
+            failure "Debirf fakeroot state file '${DEBIRF_FAKEROOT_STATE}' does not exist."
+        fi
+        # set up $PATH and $HOME as though we are superuser
+        HOME=/root PATH=/debirf/project:/debirf:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin bash fakeroot -i "$DEBIRF_FAKEROOT_STATE" -s "$DEBIRF_FAKEROOT_STATE" "$@"
+    fi
+}
+export -f fakeroot_if_needed
+
+# execute command in debirf system using chroot
+function debirf_exec()
+{
+    if [ "${ROOT_BUILD}" = 'true' ]
+    then
+        TMPDIR="" chroot "${DEBIRF_ROOT}" "${@}"
+    else
+        TMPDIR="" fakechroot chroot "${DEBIRF_ROOT}" "${@}"
+    fi
+}
+export -f debirf_exec
+
+# write comment to debirf.info file
+function debirf_info_comment()
+{
+    echo "${*}" | sed 's|^\(.\)|\# \1|' >> "${DEBIRF_ROOT}/etc/debirf/debirf.info"
+}
+export -f debirf_info_comment
+
+# write command to debirf.info file
+function debirf_info_sh()
+{
+    echo "${@}" >> "${DEBIRF_ROOT}/etc/debirf/debirf.info"
+}
+export -f debirf_info_sh
+
+lib="lib/lib.sh"
+if [[ -n "${DEBIRF_PROFILE}" ]]
+then
+    lib="${DEBIRF_PROFILE}/${lib}"
+fi
+if [[ -f "${lib}" ]]
+then
+    set -a
+    echo "Loading lib: ${lib}" 1>&2
+    . "${lib}"
+    set +a
+else
+    echo "Custom libs are not available at ${lib} (running from ${PWD})" 1>&2
+    ls -al
+fi

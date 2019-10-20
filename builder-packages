@@ -1,0 +1,27 @@
+# For debirf itself
+debirf debootstrap genisoimage mtools
+libterm-readline-perl-perl
+
+# For setting up extra apt repos
+apt-transport-https
+ca-certificates
+gnupg2
+software-properties-common
+
+# For cloning git repos
+git
+
+# For downloading web resources
+curl w3m lynx wget
+
+# For copying data in
+rsync
+
+# Other tools
+make
+ltrace strace
+coreutils
+util-linux
+bsdmainutils
+binutils
+python3-pip
