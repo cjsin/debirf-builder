@@ -19,7 +19,7 @@ RUN    proxy_config="Acquire::HTTP::Proxy \"${APT_PROXY}\";!Acquire::HTTPS::Prox
     && touch /root/.dpkg.cfg \
     && mkdir -p /root/.cache/pip \
     && apt-get -y update \
-    && apt-get install --yes --assume-yes $PACKAGES \
+    && apt-get install --yes --assume-yes --no-install-recommends $PACKAGES \
     && rm -rf /var/lib/apt/lists/*
 #   && apt-get remove --purge -y $(apt-mark showauto) && rm -f rm -rf /var/lib/apt/lists/*
 
